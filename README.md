@@ -80,10 +80,9 @@ The Pico is connected to the computer by USB. The bridge script
 [`scripts/serial_bridge.py`](./scripts/serial_bridge.py) runs
 [`pico/main.py`](./pico/main.py) on the Pico (via `mpremote`) and forwards each
 reading (MQ135, temperature, humidity) to the API on `localhost`. Nothing is saved on the Pico and nothing runs
-on power-up; no Wi-Fi is needed.
+on power-up; the Pico also serves a Wi-Fi drive page (below).
 
-1. Wire the DHT22 data pin to **GP16** and the ST7789 320x240 LCD as in the pin
-   constants at the top of `pico/main.py`. The LCD shows the live readings.
+1. Wire the DHT22 data pin to **GP16** (VCC 3.3 V, GND). The Cutebot uses I2C on GP4/GP5.
 2. Wire the MQ135 `AO` pin to **GP26 (ADC0)**, `VCC` to 5 V (VBUS) and `GND` to
    ground. `AO` can reach 5 V, but the Pico ADC tolerates 3.3 V at most, so
    reduce it with a resistor divider (e.g. 10 kΩ + 20 kΩ). Because of this, the
@@ -94,8 +93,8 @@ on power-up; no Wi-Fi is needed.
 5. Run `py scripts\serial_bridge.py` (add a port such as `COM5` if the Pico is
    not detected automatically).
 
-The Pico warms the sensor up for 2 minutes (the LCD shows a countdown), takes 30
-readings 2 seconds apart, then stops and the bridge exits. Run the bridge again for another set.
+Join the Wi-Fi `Cutebot-Pico` (password `password123`) and open http://192.168.4.1 to drive the Cutebot (W/A/S/D) and press **Start reading**. The Pico takes 30
+readings 2 seconds apart, then the bridge exits.
 
 ## Build
 

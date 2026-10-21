@@ -1,36 +1,35 @@
-"""Pico air monitor: MQ135 (raw ADC) + DHT22 (temperature, humidity) with an LCD.
+"""Pico Cutebot: Wi-Fi drive page + MQ135 / DHT22 air readings.
 
-Wiring: MQ135 AO -> GP26 (ADC0) through a 10k/20k divider (5 V -> 3.3 V),
-DHT22 data -> GP16, ST7789 320x240 LCD on SPI1 (pins below).
+Wiring: Cutebot I2C on GP4 (SDA) / GP5 (SCL), MQ135 AO -> GP26 (ADC0) through a
+10k/20k divider (5 V -> 3.3 V), DHT22 data -> GP16 (3.3 V supply).
 
-After a warm-up the script takes READINGS_PER_RUN readings, one every 2 seconds,
-shows them on the LCD, and prints each as a line `mq135_raw,temp_c,humidity` over
-USB (temp/humidity are empty when the DHT22 read fails). It then prints DONE and
-stops. scripts/serial_bridge.py runs this file and forwards the readings to the
-dashboard API.
+The Pico is an access point (SSID Cutebot-Pico). Open http://192.168.4.1 to drive
+(W/A/S/D or the on-screen buttons) and to press "Start reading". A run takes
+READINGS_PER_RUN readings, one every 2 seconds, and prints each as a line
+`mq135_raw,temp_c,humidity` over USB (temp/humidity are empty when the DHT22 read
+fails), then prints DONE. scripts/serial_bridge.py runs this file and forwards
+the readings to the dashboard API.
 """
 
-import framebuf
-import gc
+import json
+import network
+import socket
 import time
 import dht
-from machine import ADC, PWM, SPI, Pin
-
-# Clear RAM before allocating framebuffer
-gc.collect()
+from machine import ADC, I2C, Pin
 
 # --- Pin Configuration ---
-DC_PIN = 8
-CS_PIN = 9
-SCK_PIN = 10
-MOSI_PIN = 11
-RST_PIN = 12
-BL_PIN = 13
+SDA_PIN = 4
+SCL_PIN = 5
 DHT_PIN = 16
 MQ135_PIN = 26  # ADC0 pin connected to MQ135 voltage divider
 
-WIDTH = 320
-HEIGHT = 240
+CUTEBOT_ADDR = 0x10
+
+# --- Drive settings ---
+DRIVE_SPEED = 50
+TURN_SPEED = 40
+WATCHDOG_TIMEOUT_MS = 1000  # stop if no command arrives (the page re-sends every 300 ms)
 
 # --- Run settings ---
 READINGS_PER_RUN = 30
@@ -39,136 +38,28 @@ WARMUP_S = 10  # the MQ135 heater needs time to stabilise; longer is better
 SAMPLES_PER_READING = 8  # ADC samples averaged into each reading
 SAMPLE_DELAY_MS = 20
 
-
-class PicoLCD20(framebuf.FrameBuffer):
-
-    def __init__(self):
-        self.width = WIDTH
-        self.height = HEIGHT
-
-        self.cs = Pin(CS_PIN, Pin.OUT)
-        self.rst = Pin(RST_PIN, Pin.OUT)
-        self.dc = Pin(DC_PIN, Pin.OUT)
-
-        self.cs(1)
-        self.dc(1)
-
-        self.spi = SPI(
-            1,
-            20_000_000,
-            polarity=0,
-            phase=0,
-            sck=Pin(SCK_PIN),
-            mosi=Pin(MOSI_PIN),
-            miso=None,
-        )
-
-        self.buffer = bytearray(self.height * self.width * 2)
-        super().__init__(self.buffer, self.width, self.height, framebuf.RGB565)
-
-        self.init_display()
-
-    def write_cmd(self, cmd):
-        self.cs(1)
-        self.dc(0)
-        self.cs(0)
-        self.spi.write(bytearray([cmd]))
-        self.cs(1)
-
-    def write_data(self, buf):
-        self.cs(1)
-        self.dc(1)
-        self.cs(0)
-        self.spi.write(bytearray([buf]))
-        self.cs(1)
-
-    def init_display(self):
-        self.rst(1)
-        time.sleep_ms(10)
-        self.rst(0)
-        time.sleep_ms(10)
-        self.rst(1)
-        time.sleep_ms(10)
-
-        self.write_cmd(0x36)
-        self.write_data(0x70)
-
-        self.write_cmd(0x3A)
-        self.write_data(0x05)
-
-        self.write_cmd(0xB2)
-        for val in [0x0C, 0x0C, 0x00, 0x33, 0x33]:
-            self.write_data(val)
-
-        self.write_cmd(0xB7)
-        self.write_data(0x35)
-        self.write_cmd(0xBB)
-        self.write_data(0x19)
-        self.write_cmd(0xC0)
-        self.write_data(0x2C)
-        self.write_cmd(0xC2)
-        self.write_data(0x01)
-        self.write_cmd(0xC3)
-        self.write_data(0x12)
-        self.write_cmd(0xC4)
-        self.write_data(0x20)
-        self.write_cmd(0xC6)
-        self.write_data(0x0F)
-        self.write_cmd(0xD0)
-        self.write_data(0xA4)
-        self.write_data(0xA1)
-
-        self.write_cmd(0x21)
-        self.write_cmd(0x11)
-        time.sleep_ms(120)
-        self.write_cmd(0x29)
-
-    def show(self):
-        self.write_cmd(0x2A)
-        self.write_data(0x00)
-        self.write_data(0x00)
-        self.write_data(0x01)
-        self.write_data(0x3F)
-
-        self.write_cmd(0x2B)
-        self.write_data(0x00)
-        self.write_data(0x00)
-        self.write_data(0x00)
-        self.write_data(0xEF)
-
-        self.write_cmd(0x2C)
-
-        self.cs(1)
-        self.dc(1)
-        self.cs(0)
-        self.spi.write(self.buffer)
-        self.cs(1)
-
-
-def color565(r, g, b):
-    c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-    return ((c & 0xFF) << 8) | ((c >> 8) & 0xFF)
-
-
-# PWM Backlight
-pwm = PWM(Pin(BL_PIN))
-pwm.freq(1000)
-pwm.duty_u16(45000)
-
-# Display & Sensor Setup
-lcd = PicoLCD20()
+led = Pin("LED", Pin.OUT)
+i2c = I2C(0, sda=Pin(SDA_PIN), scl=Pin(SCL_PIN), freq=100000)
 dht_sensor = dht.DHT22(Pin(DHT_PIN, Pin.IN, Pin.PULL_UP))
 mq135_adc = ADC(Pin(MQ135_PIN))
 
-# Palette
-BLACK = color565(0, 0, 0)
-WHITE = color565(255, 255, 255)
-BLUE = color565(0, 100, 220)
-CYAN = color565(0, 220, 255)
-GREEN = color565(0, 255, 64)
-YELLOW = color565(255, 220, 0)
-RED = color565(255, 50, 50)
-DARK_GRAY = color565(25, 25, 25)
+boot_ms = time.ticks_ms()
+
+
+def set_motors(left, right):
+    left = max(-100, min(100, left))
+    right = max(-100, min(100, right))
+    l_dir = 0x02 if left >= 0 else 0x01
+    r_dir = 0x02 if right >= 0 else 0x01
+    try:
+        i2c.writeto(CUTEBOT_ADDR, bytes([0x01, l_dir, abs(left), 0x00]))
+        i2c.writeto(CUTEBOT_ADDR, bytes([0x02, r_dir, abs(right), 0x00]))
+    except OSError:
+        pass
+
+
+def stop_motors():
+    set_motors(0, 0)
 
 
 def read_mq135():
@@ -189,86 +80,240 @@ def read_dht():
         return None, None
 
 
-def draw_screen(raw_adc, temp_c, humidity, footer):
-    lcd.fill(BLACK)
+HTML_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Cutebot Wireless</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; background: #111; color: #fff; user-select: none; margin: 0; padding: 20px; }
+    h1 { color: #00e5ff; }
+    .grid { display: grid; grid-template-columns: 90px 90px 90px; gap: 12px; justify-content: center; margin-top: 30px; }
+    .btn { width: 90px; height: 90px; font-size: 28px; font-weight: bold; background: #222; color: #00e5ff; border: 2px solid #00e5ff; border-radius: 16px; touch-action: manipulation; outline: none; }
+    .btn:active { background: #00e5ff; color: #000; }
+    .empty { visibility: hidden; }
+    #start { margin-top: 30px; padding: 14px 28px; font-size: 20px; font-weight: bold; background: #00c853; color: #000; border: 0; border-radius: 12px; }
+    #start:disabled { background: #444; color: #999; }
+    #status { margin-top: 16px; font-size: 18px; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <h1>Cutebot Drive</h1>
+  <div class="grid">
+    <div class="empty"></div>
+    <button class="btn" id="btn-w" tabindex="-1">W</button>
+    <div class="empty"></div>
+    <button class="btn" id="btn-a" tabindex="-1">A</button>
+    <button class="btn" id="btn-s" tabindex="-1">S</button>
+    <button class="btn" id="btn-d" tabindex="-1">D</button>
+  </div>
+  <button id="start">Start reading</button>
+  <div id="status">Idle</div>
 
-    # Header Bar
-    lcd.rect(0, 0, 320, 30, BLUE, True)
-    lcd.text("PICO AIR & TEMP MONITOR", 65, 10, WHITE)
+  <script>
+    const KEYS = ['w', 'a', 's', 'd'];
+    let activeKey = null;
+    let heartbeat = null;
 
-    # Categorize Air Quality Level
-    v_pin = (raw_adc / 65535) * 3.3
-    v_sensor = v_pin * 1.5  # Accounts for 10k/20k divider (5V -> 3.3V)
-    if v_sensor < 1.2:
-        air_status = "Good"
-        air_color = GREEN
-    elif v_sensor < 2.2:
-        air_status = "Moderate"
-        air_color = YELLOW
-    else:
-        air_status = "Poor / High Gas"
-        air_color = RED
+    function sendCmd(cmd) {
+      fetch('/' + cmd + '?t=' + Date.now()).catch(() => {});
+    }
 
-    # Temperature Box
-    lcd.rect(10, 36, 300, 48, DARK_GRAY, True)
-    lcd.text("TEMPERATURE", 20, 42, CYAN)
-    # Humidity Box
-    lcd.rect(10, 90, 300, 48, DARK_GRAY, True)
-    lcd.text("HUMIDITY", 20, 96, CYAN)
-    if temp_c is None:
-        lcd.text("Sensor Error", 30, 62, RED)
-        lcd.text("Sensor Error", 30, 116, RED)
-    else:
-        temp_f = (temp_c * 9 / 5) + 32
-        lcd.text(f"{temp_c:.1f} C  /  {temp_f:.1f} F", 30, 62, GREEN)
-        lcd.text(f"{humidity:.1f} %", 30, 116, GREEN)
+    // The Pico stops on its own if commands stop arriving, so keep re-sending while held.
+    function startDrive(k) {
+      if (activeKey === k) return;
+      activeKey = k;
+      sendCmd(k);
+      clearInterval(heartbeat);
+      heartbeat = setInterval(() => sendCmd(k), 300);
+    }
 
-    # Air Quality Box (MQ135)
-    lcd.rect(10, 144, 300, 48, DARK_GRAY, True)
-    lcd.text("AIR QUALITY (MQ135)", 20, 150, CYAN)
-    lcd.text(f"{v_sensor:.2f}V - {air_status}", 30, 170, air_color)
+    function stopDrive() {
+      if (activeKey === null) return;
+      activeKey = null;
+      clearInterval(heartbeat);
+      sendCmd('stop');
+      setTimeout(() => { if (activeKey === null) sendCmd('stop'); }, 150);
+    }
 
-    lcd.text(footer, 10, 218, WHITE)
-    lcd.show()
+    document.addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (KEYS.includes(k)) {
+        e.preventDefault();
+        if (!e.repeat) startDrive(k);
+      }
+    });
 
+    document.addEventListener('keyup', (e) => {
+      const k = e.key.toLowerCase();
+      if (k === activeKey) {
+        e.preventDefault();
+        stopDrive();
+      }
+    });
 
-def show_message(text):
-    lcd.fill(BLACK)
-    lcd.rect(0, 0, 320, 30, BLUE, True)
-    lcd.text("PICO AIR & TEMP MONITOR", 65, 10, WHITE)
-    lcd.text(text, 10, 110, WHITE)
-    lcd.show()
+    window.addEventListener('blur', stopDrive);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) stopDrive();
+    });
+
+    KEYS.forEach(k => {
+      const btn = document.getElementById('btn-' + k);
+      const down = (e) => { e.preventDefault(); startDrive(k); };
+      const up = (e) => { e.preventDefault(); if (activeKey === k) stopDrive(); };
+      btn.addEventListener('mousedown', down);
+      btn.addEventListener('mouseup', up);
+      btn.addEventListener('mouseleave', up);
+      btn.addEventListener('touchstart', down);
+      btn.addEventListener('touchend', up);
+      btn.addEventListener('touchcancel', up);
+    });
+
+    const startBtn = document.getElementById('start');
+    const statusBox = document.getElementById('status');
+    startBtn.addEventListener('click', () => {
+      startBtn.disabled = true;
+      fetch('/start?t=' + Date.now()).catch(() => {});
+    });
+
+    function render(s) {
+      startBtn.disabled = s.state === 'warmup' || s.state === 'reading';
+      let text = s.state === 'idle' ? 'Idle' :
+                 s.state === 'warmup' ? 'Warming up sensor...' :
+                 s.state === 'reading' ? 'Reading ' + s.count + '/' + s.total :
+                 'Done - ' + s.total + ' readings sent';
+      if (s.mq !== null) {
+        const v = s.mq / 65535 * 3.3 * 1.5;
+        text += '<br>Air (MQ135): ' + v.toFixed(2) + ' V';
+        text += '<br>Temperature: ' + (s.temp === null ? 'error' : s.temp.toFixed(1) + ' &deg;C');
+        text += '<br>Humidity: ' + (s.hum === null ? 'error' : s.hum.toFixed(1) + ' %');
+      }
+      statusBox.innerHTML = text;
+    }
+
+    setInterval(() => {
+      fetch('/status?t=' + Date.now()).then(r => r.json()).then(render).catch(() => {});
+    }, 1000);
+  </script>
+</body>
+</html>
+"""
+
+HTML_BYTES = HTML_PAGE.encode("utf-8")
+OK = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
+
+DRIVES = {
+    "/w": (DRIVE_SPEED, DRIVE_SPEED),
+    "/s": (-DRIVE_SPEED, -DRIVE_SPEED),
+    "/a": (-TURN_SPEED, TURN_SPEED),
+    "/d": (TURN_SPEED, -TURN_SPEED),
+}
 
 
 def main():
-    print("Warming up sensor for %d s..." % WARMUP_S)
-    for left in range(WARMUP_S, 0, -1):
-        if left % 5 == 0:
-            show_message("Warming up sensor: %d s" % left)
-        time.sleep(1)
+    ap = network.WLAN(network.AP_IF)
+    ap.config(essid="Cutebot-Pico", password="password123")
+    ap.active(True)
+    led.on()
 
-    for number in range(1, READINGS_PER_RUN + 1):
-        started = time.ticks_ms()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("", 80))
+    server.listen(2)
+    server.settimeout(0.05)
 
-        raw_adc = read_mq135()
-        temp_c, humidity = read_dht()
-        if temp_c is None:
-            print("%d,," % raw_adc)
-        else:
-            print("%d,%.1f,%.1f" % (raw_adc, temp_c, humidity))
-        draw_screen(raw_adc, temp_c, humidity, "Reading %d/%d" % (number, READINGS_PER_RUN))
+    last_cmd_time = time.ticks_ms()
+    is_moving = False
 
-        # Keep a steady cadence regardless of how long the reading took.
-        elapsed = time.ticks_diff(time.ticks_ms(), started)
-        time.sleep_ms(max(0, READING_INTERVAL_MS - elapsed))
+    state = "idle"  # idle -> warmup -> reading -> done
+    count = 0
+    next_reading = 0
+    last = (None, None, None)  # mq135_raw, temp_c, humidity
 
-    show_message("Done - %d readings sent" % READINGS_PER_RUN)
-    print("DONE")
+    while True:
+        conn = None
+        try:
+            conn, _ = server.accept()
+            conn.settimeout(0.2)
+            request = conn.recv(512).decode("utf-8")
+            parts = request.split(" ", 2)
+            path = parts[1].split("?")[0] if len(parts) > 1 and parts[0] == "GET" else ""
+
+            if path in DRIVES:
+                set_motors(*DRIVES[path])
+                is_moving = True
+                last_cmd_time = time.ticks_ms()
+                conn.sendall(OK)
+            elif path == "/stop":
+                stop_motors()
+                is_moving = False
+                conn.sendall(OK)
+            elif path == "/start":
+                if state in ("idle", "done"):
+                    state = "warmup"
+                    count = 0
+                    last = (None, None, None)
+                conn.sendall(OK)
+            elif path == "/status":
+                body = json.dumps(
+                    {
+                        "state": state,
+                        "count": count,
+                        "total": READINGS_PER_RUN,
+                        "mq": last[0],
+                        "temp": last[1],
+                        "hum": last[2],
+                    }
+                ).encode("utf-8")
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Cache-Control: no-store\r\nContent-Length: "
+                    + str(len(body)).encode()
+                    + b"\r\nConnection: close\r\n\r\n"
+                    + body
+                )
+            elif path in ("/", "/index.html"):
+                header = (
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
+                    "Content-Length: %d\r\nConnection: close\r\n\r\n" % len(HTML_BYTES)
+                )
+                conn.sendall(header.encode("utf-8"))
+                conn.sendall(HTML_BYTES)
+            else:
+                conn.sendall(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+        except OSError:
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
+
+        # Watchdog fail-safe: stop if commands stop arriving (Wi-Fi lost, page closed).
+        if is_moving and time.ticks_diff(time.ticks_ms(), last_cmd_time) > WATCHDOG_TIMEOUT_MS:
+            stop_motors()
+            is_moving = False
+
+        if state == "warmup":
+            if time.ticks_diff(time.ticks_ms(), boot_ms) >= WARMUP_S * 1000:
+                state = "reading"
+                next_reading = time.ticks_ms()
+                print("Warm-up done, reading...")
+        elif state == "reading" and time.ticks_diff(time.ticks_ms(), next_reading) >= 0:
+            next_reading = time.ticks_add(next_reading, READING_INTERVAL_MS)
+            raw_adc = read_mq135()
+            temp_c, humidity = read_dht()
+            last = (raw_adc, temp_c, humidity)
+            count += 1
+            if temp_c is None:
+                print("%d,," % raw_adc)
+            else:
+                print("%d,%.1f,%.1f" % (raw_adc, temp_c, humidity))
+            if count >= READINGS_PER_RUN:
+                state = "done"
+                print("DONE")
 
 
 try:
     main()
 except KeyboardInterrupt:
-    lcd.fill(BLACK)
-    lcd.show()
-    pwm.duty_u16(0)
+    stop_motors()
+    led.off()
