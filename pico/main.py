@@ -3,12 +3,14 @@
 Wiring: Cutebot I2C on GP4 (SDA) / GP5 (SCL), MQ135 AO -> GP26 (ADC0) through a
 10k/20k divider (5 V -> 3.3 V), DHT22 data -> GP16 (3.3 V supply).
 
-The Pico is an access point (SSID Cutebot-Pico). Open http://192.168.4.1 to drive
-(W/A/S/D or the on-screen buttons) and to press "Start reading". A run takes
-READINGS_PER_RUN readings, one every 2 seconds, and prints each as a line
-`mq135_raw,temp_c,humidity` over USB (temp/humidity are empty when the DHT22 read
-fails), then prints DONE. scripts/serial_bridge.py runs this file and forwards
-the readings to the dashboard API.
+The Pico joins the Wi-Fi named in config.py; if WIFI_SSID is empty or the join
+fails, it becomes an access point (SSID Cutebot-Pico, http://192.168.4.1). Open the
+page to drive (W/A/S/D or the on-screen buttons) and to press "Start reading".
+A run takes READINGS_PER_RUN readings, one every 2 seconds. The Pico keeps the
+latest readings and serves them at /readings?since=N; scripts/wifi_bridge.py on
+the PC fetches them and posts them to the dashboard API. Each reading is also
+printed over USB as `mq135_raw,temp_c,humidity` (temp/humidity are empty when
+the DHT22 read fails), followed by DONE, so scripts/serial_bridge.py still works.
 """
 
 import json
@@ -17,6 +19,13 @@ import socket
 import time
 import dht
 from machine import ADC, I2C, Pin
+
+try:
+    import config
+except ImportError:
+    config = None
+
+MAX_STORED = 100  # latest readings kept for the PC to fetch
 
 # --- Pin Configuration ---
 SDA_PIN = 4
@@ -27,7 +36,7 @@ MQ135_PIN = 26  # ADC0 pin connected to MQ135 voltage divider
 CUTEBOT_ADDR = 0x10
 
 # --- Drive settings ---
-DRIVE_SPEED = 50
+DRIVE_SPEED = 100                                                                                                                                                                       
 TURN_SPEED = 40
 WATCHDOG_TIMEOUT_MS = 1000  # stop if no command arrives (the page re-sends every 300 ms)
 
@@ -181,7 +190,7 @@ HTML_PAGE = """<!DOCTYPE html>
       let text = s.state === 'idle' ? 'Idle' :
                  s.state === 'warmup' ? 'Warming up sensor...' :
                  s.state === 'reading' ? 'Reading ' + s.count + '/' + s.total :
-                 'Done - ' + s.total + ' readings sent';
+                 'Done - ' + s.total + ' readings taken';
       if (s.mq !== null) {
         const v = s.mq / 65535 * 3.3 * 1.5;
         text += '<br>Air (MQ135): ' + v.toFixed(2) + ' V';
@@ -210,10 +219,51 @@ DRIVES = {
 }
 
 
+def connect_wifi():
+    # Returns True when joined to the configured network.
+    if config is None or not getattr(config, "WIFI_SSID", ""):
+        return False
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(config.WIFI_SSID, config.WIFI_PASSWORD)
+    for _ in range(30):
+        if wlan.isconnected():
+            print("Wi-Fi joined, open http://%s" % wlan.ifconfig()[0])
+            return True
+        led.toggle()
+        time.sleep_ms(500)
+    wlan.active(False)
+    return False
+
+
+def send_json(conn, body):
+    conn.sendall(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        b"Cache-Control: no-store\r\nContent-Length: "
+        + str(len(body)).encode()
+        + b"\r\nConnection: close\r\n\r\n"
+        + body
+    )
+
+
+def close_after_client(conn):
+    # Let the client close first: a connection the Pico closes itself lingers in
+    # TIME_WAIT, and the small TCP table fills up after a few requests.
+    try:
+        conn.settimeout(0.3)
+        conn.recv(1)
+    except OSError:
+        pass
+    conn.close()
+
+
 def main():
-    ap = network.WLAN(network.AP_IF)
-    ap.config(essid="Cutebot-Pico", password="password123")
-    ap.active(True)
+    online = connect_wifi()
+    if not online:
+        ap = network.WLAN(network.AP_IF)
+        ap.config(essid="Cutebot-Pico", password="password123")
+        ap.active(True)
+        print("Access point Cutebot-Pico, http://192.168.4.1")
     led.on()
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -228,6 +278,8 @@ def main():
     state = "idle"  # idle -> warmup -> reading -> done
     count = 0
     next_reading = 0
+    seen = 0  # total readings taken since boot
+    stored = []  # the latest MAX_STORED readings
     last = (None, None, None)  # mq135_raw, temp_c, humidity
 
     while True:
@@ -265,13 +317,18 @@ def main():
                         "hum": last[2],
                     }
                 ).encode("utf-8")
-                conn.sendall(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                    b"Cache-Control: no-store\r\nContent-Length: "
-                    + str(len(body)).encode()
-                    + b"\r\nConnection: close\r\n\r\n"
-                    + body
-                )
+                send_json(conn, body)
+            elif path == "/readings":
+                # Readings numbered from 1; return those after `since`.
+                since = 0
+                if "since=" in request.split(" ", 2)[1]:
+                    try:
+                        since = int(request.split(" ", 2)[1].split("since=")[1].split("&")[0])
+                    except (ValueError, OverflowError):
+                        pass
+                first = seen - len(stored) + 1  # number of stored[0]
+                start = min(len(stored), max(0, since + 1 - first))
+                send_json(conn, json.dumps({"seen": seen, "readings": stored[start:]}).encode("utf-8"))
             elif path in ("/", "/index.html"):
                 header = (
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
@@ -281,11 +338,12 @@ def main():
                 conn.sendall(HTML_BYTES)
             else:
                 conn.sendall(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
-        except OSError:
-            pass
+        except Exception as error:  # a bad request must never stop the drive loop
+            if not isinstance(error, OSError):
+                print("Request error:", error)
         finally:
             if conn is not None:
-                conn.close()
+                close_after_client(conn)
 
         # Watchdog fail-safe: stop if commands stop arriving (Wi-Fi lost, page closed).
         if is_moving and time.ticks_diff(time.ticks_ms(), last_cmd_time) > WATCHDOG_TIMEOUT_MS:
@@ -307,6 +365,9 @@ def main():
                 print("%d,," % raw_adc)
             else:
                 print("%d,%.1f,%.1f" % (raw_adc, temp_c, humidity))
+            seen += 1
+            stored.append({"value": raw_adc, "temperature": temp_c, "humidity": humidity})
+            del stored[:-MAX_STORED]
             if count >= READINGS_PER_RUN:
                 state = "done"
                 print("DONE")

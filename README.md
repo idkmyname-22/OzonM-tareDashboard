@@ -96,6 +96,15 @@ on power-up; the Pico also serves a Wi-Fi drive page (below).
 Join the Wi-Fi `Cutebot-Pico` (password `password123`) and open http://192.168.4.1 to drive the Cutebot (W/A/S/D) and press **Start reading**. The Pico takes 30
 readings 2 seconds apart, then the bridge exits.
 
+### Running without USB
+
+The Pico stores its latest 100 readings; a script on the PC polls them and forwards them to the API.
+
+1. Copy `pico/config.example.py` to `pico/config.py` and leave `WIFI_SSID` empty so the Pico makes its own Wi-Fi.
+2. With the Pico plugged in once (close Thonny): `mpremote connect COM3 cp pico\config.py :config.py` and `mpremote connect COM3 cp pico\main.py :main.py`.
+3. The PC needs two connections: one adapter on `Cutebot-Pico` (password `password123`) and one with internet (not a school-managed network, whose policy drops the second connection). Add the internet connection's public IP to MongoDB Atlas Network Access.
+4. Run `npm run live`. It starts the API and `scripts/wifi_bridge.py` together; open http://192.168.4.1, drive and press **Start reading**. Readings reach the dashboard automatically.
+
 ## Build
 
 ```sh

@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "api": "node server/index.js",
+    "bridge": "python scripts/wifi_bridge.py",
+    "live": "run-p api bridge",
     "build": "run-p type-check \"build-only {@}\" --",
     "preview": "vite preview",
     "build-only": "vite build",

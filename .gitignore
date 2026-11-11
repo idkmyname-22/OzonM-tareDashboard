@@ -42,3 +42,6 @@ __screenshots__/
 *.timestamp-*-*.mjs
 
 __pycache__
+
+# Pico Wi-Fi/API secrets
+pico/config.py
